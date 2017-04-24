@@ -237,7 +237,9 @@ ZongJi.prototype.stop = function(callback){
     'KILL ' + self.connection.threadId,
     function(error, results){
       self.ctrlPool.end(function (err) {
-        callback(err);
+        if (callback) {
+          callback(err);
+        }
       });
     }
   );
