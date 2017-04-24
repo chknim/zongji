@@ -11,11 +11,10 @@ function ZongJi(dsn, options) {
   // to send table info query
   var ctrlDsn = cloneObjectSimple(dsn);
   ctrlDsn.database = 'information_schema';
-  this.ctrlConnection = mysql.createConnection(ctrlDsn);
-  this.ctrlConnection.on('error', this._emitError.bind(this));
-  this.ctrlConnection.on('unhandledError', this._emitError.bind(this));
+  this.ctrlPool = mysql.createPool(ctrlDsn);
+  this.ctrlPool.on('error', this._emitError.bind(this));
+  this.ctrlPool.on('unhandledError', this._emitError.bind(this));
 
-  this.ctrlConnection.connect();
   this.ctrlCallbacks = [];
 
   this.connection = mysql.createConnection(dsn);
@@ -25,9 +24,6 @@ function ZongJi(dsn, options) {
   this.tableMap = {};
   this.ready = false;
   this.useChecksum = false;
-  // Include 'rotate' events to keep these properties updated
-  this.binlogName = null;
-  this.binlogNextPos = null;
 
   this._init();
 }
@@ -90,11 +86,6 @@ ZongJi.prototype._init = function() {
       binlogOptions.serverId = self.options.serverId;
     }
 
-    if(('binlogName' in self.options) && ('binlogNextPos' in self.options)) {
-      binlogOptions.filename = self.options.binlogName;
-      binlogOptions.position = self.options.binlogNextPos
-    }
-
     self.binlog = generateBinlog.call(self, binlogOptions);
     self.ready = true;
     self._executeCtrlCallbacks();
@@ -104,10 +95,10 @@ ZongJi.prototype._init = function() {
 ZongJi.prototype._isChecksumEnabled = function(next) {
   var self = this;
   var sql = 'select @@GLOBAL.binlog_checksum as checksum';
-  var ctrlConnection = self.ctrlConnection;
+  var ctrlPool = self.ctrlPool;
   var connection = self.connection;
 
-  ctrlConnection.query(sql, function(err, rows) {
+  ctrlPool.query(sql, function(err, rows) {
     if (err) {
       if(err.toString().match(/ER_UNKNOWN_SYSTEM_VARIABLE/)){
         // MySQL < 5.6.2 does not support @@GLOBAL.binlog_checksum
@@ -142,7 +133,7 @@ ZongJi.prototype._isChecksumEnabled = function(next) {
 
 ZongJi.prototype._findBinlogEnd = function(next) {
   var self = this;
-  self.ctrlConnection.query('SHOW BINARY LOGS', function(err, rows) {
+  self.ctrlPool.query('SHOW BINARY LOGS', function(err, rows) {
     if (err) {
       // Errors should be emitted
       self.emit('error', err);
@@ -163,14 +154,14 @@ ZongJi.prototype._executeCtrlCallbacks = function() {
 var tableInfoQueryTemplate = 'SELECT ' +
   'COLUMN_NAME, COLLATION_NAME, CHARACTER_SET_NAME, ' +
   'COLUMN_COMMENT, COLUMN_TYPE ' +
-  "FROM columns " + "WHERE table_schema='%s' AND table_name='%s'";
+  'FROM columns ' + 'WHERE table_schema="%s" AND table_name="%s"';
 
 ZongJi.prototype._fetchTableInfo = function(tableMapEvent, next) {
   var self = this;
   var sql = util.format(tableInfoQueryTemplate,
     tableMapEvent.schemaName, tableMapEvent.tableName);
 
-  this.ctrlConnection.query(sql, function(err, rows) {
+  this.ctrlPool.query(sql, function(err, rows) {
     if (err) {
       // Errors should be emitted
       self.emit('error', err);
@@ -213,28 +204,20 @@ ZongJi.prototype.start = function(options) {
       // Do not emit events that have been filtered out
       if(event === undefined || event._filtered === true) return;
 
-      switch(event.getTypeName()) {
-        case 'TableMap':
-          var tableMap = self.tableMap[event.tableId];
+      if (event.getTypeName() === 'TableMap') {
+        var tableMap = self.tableMap[event.tableId];
 
-          if (!tableMap) {
-            self.connection.pause();
-            self._fetchTableInfo(event, function() {
-              // merge the column info with metadata
-              event.updateColumnInfo();
-              self.emit('binlog', event);
-              self.connection.resume();
-            });
-            return;
-          }
-          break;
-        case 'Rotate':
-          if (self.binlogName !== event.binlogName) {
-            self.binlogName = event.binlogName;
-          }
-          break;
+        if (!tableMap) {
+          self.connection.pause();
+          self._fetchTableInfo(event, function() {
+            // merge the column info with metadata
+            event.updateColumnInfo();
+            self.emit('binlog', event);
+            self.connection.resume();
+          });
+          return;
+        }
       }
-      self.binlogNextPos = event.nextPosition;
       self.emit('binlog', event);
     }));
   };
@@ -246,14 +229,16 @@ ZongJi.prototype.start = function(options) {
   }
 };
 
-ZongJi.prototype.stop = function(){
+ZongJi.prototype.stop = function(callback){
   var self = this;
   // Binary log connection does not end with destroy()
   self.connection.destroy();
-  self.ctrlConnection.query(
+  self.ctrlPool.query(
     'KILL ' + self.connection.threadId,
-    function(error, reuslts){
-      self.ctrlConnection.destroy();
+    function(error, results){
+      self.ctrlPool.end(function (err) {
+        callback(err);
+      });
     }
   );
 };
